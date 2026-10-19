@@ -1,17 +1,18 @@
+<!-- knowledge
+last_checked: "2026-10-15T00:58:08Z"
+-->
 # Layers
 
 Pluggable middleware for engine extensions.
 
-## Components
+## Lifecycle integration
 
-### Layer (base)
-
-Base class with optional lifecycle hooks for layers.
-
-- `initialize()` - Receive runtime context (runtime state is bound here and always available to hooks)
-- `on_graph_start()` - Execution start hook
-- `on_event()` - Process all events
-- `on_graph_end()` - Execution end hook
+The [Layer API](base.py) defines hooks and runtime access. Use task context
+managers to activate tracing context; keep logical spans alive across container
+suspension without carrying context tokens between workers. The
+[worker](../worker/worker.py) owns task execution, and
+[context tests](../../../../tests/engine/test_layer_node_run_context.py) enforce
+nested context binding and failure isolation.
 
 ## Usage
 
@@ -37,5 +38,5 @@ class MetricsLayer(Layer):
             self.metrics[event.node_id] = duration.total_seconds()
 ```
 
-`engine.add_layer()` binds the read-only runtime state before execution, so
-`runtime_state` is always available inside layer hooks.
+For snapshot persistence from hooks, follow the
+[snapshot contract](../../../../ARCHITECTURE.md#state-and-execution-invariants).

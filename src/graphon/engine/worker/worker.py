@@ -6,9 +6,10 @@ to the dispatch queue for the dispatcher to process.
 
 import logging
 import queue
+import sys
 import threading
-from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import final, override
@@ -16,11 +17,6 @@ from uuid import uuid4
 
 from graphon.engine.frame import FrameRegistry
 from graphon.engine.layer import Layer
-from graphon.engine.ready_queue import (
-    ReadyQueue,
-    ReadyTask,
-    StartTask,
-)
 from graphon.engine_events.base import NodeEvent
 from graphon.engine_events.node import (
     NodeRunFailedEvent,
@@ -28,6 +24,8 @@ from graphon.engine_events.node import (
     is_node_result_event,
 )
 from graphon.enums import WorkflowNodeExecutionStatus
+from graphon.file.protocols import WorkflowFileRuntimeProtocol
+from graphon.file.runtime import use_workflow_file_runtime
 from graphon.node_events.base import NodeRunResult
 from graphon.nodes.base.node import Node
 from graphon.nodes.container_effects import (
@@ -35,6 +33,11 @@ from graphon.nodes.container_effects import (
 )
 from graphon.runtime.container_state import create_container_run_state
 from graphon.runtime.execution import ROOT_FRAME_ID
+from graphon.runtime.ready_queue import (
+    ReadyQueue,
+    ReadyTask,
+    StartTask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,7 @@ class Worker(threading.Thread):
         task_acquisition_lock: threading.Lock,
         task_acquisition_enabled: threading.Event,
         worker_id: int = 0,
-        execution_context: AbstractContextManager[object] | None = None,
+        file_runtime: WorkflowFileRuntimeProtocol | None = None,
     ) -> None:
         """Initialize worker thread.
 
@@ -86,16 +89,14 @@ class Worker(threading.Thread):
             task_acquisition_enabled: Shared flag indicating whether workers may
                 acquire new ready tasks.
             worker_id: Unique identifier for this worker
-            execution_context: Optional execution context for context preservation
+            file_runtime: File adapter supplied by the engine.
 
         """
         super().__init__(name=f"EngineWorker-{worker_id}", daemon=True)
         self._ready_queue = ready_queue
         self._dispatch_queue = dispatch_queue
         self._frame_registry = frame_registry
-        self._execution_context = (
-            execution_context if execution_context is not None else nullcontext()
-        )
+        self._file_runtime = file_runtime
         self._stop_event = threading.Event()
         self._layers = layers
         self._task_acquisition_lock = task_acquisition_lock
@@ -121,6 +122,17 @@ class Worker(threading.Thread):
         Continuously pulls node IDs from ready_queue, executes them,
         and pushes results to the dispatch queue until stopped.
         """
+        frames = self._frame_registry.frames()
+        with (
+            use_workflow_file_runtime(self._file_runtime),
+            frames[0].state.graph_execution.track_execution()
+            if frames
+            else nullcontext(),
+        ):
+            self._run_tasks()
+
+    def _run_tasks(self) -> None:
+        """Acquire and execute tasks until this worker is stopped."""
         while not self._stop_event.is_set():
             with self._task_acquisition_lock:
                 if not self._task_acquisition_enabled.is_set():
@@ -220,7 +232,13 @@ class Worker(threading.Thread):
         error: Exception | None = None
         result_event: NodeEvent | None = None
         suspended = False
-        with self._execution_context:
+        with ExitStack() as contexts:
+            if self._layers:
+                parent_execution_id = self._parent_execution_id()
+                for layer in self._layers:
+                    contexts.enter_context(
+                        self._node_run_context(layer, node, parent_execution_id),
+                    )
             if invocation_id is None:
                 self._invoke_node_run_start_hooks(node)
             try:
@@ -237,6 +255,51 @@ class Worker(threading.Thread):
             finally:
                 if not suspended:
                     self._invoke_node_run_end_hooks(node, error, result_event)
+
+    def _parent_execution_id(self) -> str | None:
+        if self._current_frame_id == ROOT_FRAME_ID:
+            return None
+        root_state = self._frame_registry[ROOT_FRAME_ID].state
+        frame_state = root_state.get_container_frame(self._current_frame_id)
+        parent_run = root_state.get_container_run(frame_state.parent_invocation_id)
+        parent_state = self._frame_registry[parent_run.frame_id].state
+        return parent_state.graph_execution.get_or_create_node_execution(
+            frame_id=parent_run.frame_id,
+            node_id=parent_run.node_id,
+        ).execution_id
+
+    @contextmanager
+    def _node_run_context(
+        self,
+        layer: Layer,
+        node: Node,
+        parent_execution_id: str | None,
+    ) -> Generator[None]:
+        try:
+            context = layer.node_run_context(
+                node, parent_execution_id=parent_execution_id
+            )
+            # Isolate activation failures separately from errors raised by the node.
+            context.__enter__()  # ruff: ignore[unnecessary-dunder-call]
+        except Exception:
+            logger.exception(
+                "Layer %s failed entering node_run_context for node %s",
+                type(layer).__name__,
+                node.id,
+            )
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                context.__exit__(*sys.exc_info())
+            except Exception:
+                logger.exception(
+                    "Layer %s failed exiting node_run_context for node %s",
+                    type(layer).__name__,
+                    node.id,
+                )
 
     def _consume_node_events(
         self,

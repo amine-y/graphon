@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from graphon.enums import NodeState
 from graphon.model_runtime.entities.llm_entities import LLMUsage
@@ -13,23 +12,12 @@ from graphon.runtime.container_state import (
     ContainerRunState,
     FrameRuntimeData,
 )
-from graphon.runtime.ready_queue import ReadyQueue
+from graphon.runtime.ready_queue import InMemoryReadyQueue, ReadyQueue, ReadyTask
 from graphon.runtime.variable_pool import VariablePool
 
 from ..execution import GraphExecution
 from .protocol import GraphProtocol
 from .snapshot import GraphStateMigration, load_snapshot
-
-if TYPE_CHECKING:
-    from graphon.engine.ready_queue import ReadyTask
-
-
-def _new_ready_queue() -> ReadyQueue:
-    from graphon.engine.ready_queue import (  # ruff:ignore[import-outside-top-level]
-        InMemoryReadyQueue,
-    )
-
-    return InMemoryReadyQueue()
 
 
 class RuntimeState:  # ruff:ignore[too-many-public-methods]
@@ -56,7 +44,6 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
         deferred_ready_queue: ReadyQueue | None = None,
         workflow_id: str | None = None,
         graph_execution: GraphExecution | None = None,
-        execution_context: AbstractContextManager[object] | None = None,
     ) -> None:
         """Initialize all mutable state owned by one graph execution frame.
 
@@ -76,7 +63,6 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
             deferred_ready_queue: Queue for tasks held while execution is paused.
             workflow_id: Identity used to create a new execution aggregate.
             graph_execution: Existing aggregate shared by child or restored frames.
-            execution_context: Context entered by workers around node execution.
 
         Raises:
             ValueError: If ``node_run_steps`` is negative, neither identity form
@@ -103,17 +89,14 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
         self._node_run_steps = node_run_steps
         self._graph: GraphProtocol | None = None
         self._ready_queue = (
-            ready_queue if ready_queue is not None else _new_ready_queue()
+            ready_queue if ready_queue is not None else InMemoryReadyQueue()
         )
         self._deferred_ready_queue = (
             deferred_ready_queue
             if deferred_ready_queue is not None
-            else _new_ready_queue()
+            else InMemoryReadyQueue()
         )
         self._graph_execution = graph_execution
-        self._execution_context = (
-            execution_context if execution_context is not None else nullcontext()
-        )
         self._container_runs: dict[str, ContainerRunState] = {}
         self._container_frames: dict[str, ContainerFrameState] = {}
         self._pending_graph_node_states: dict[str, NodeState] = {}
@@ -137,10 +120,6 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
     @property
     def graph_execution(self) -> GraphExecution:
         return self._graph_execution
-
-    @property
-    def execution_context(self) -> AbstractContextManager[object]:
-        return self._execution_context
 
     @property
     def start_at(self) -> float:
@@ -266,6 +245,11 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
     def dumps(self) -> str:
         """Serialize runtime state into a version 3 JSON string.
 
+        Finish consuming or close the engine run iterator and wait for all
+        execution threads to stop first. The guard is shared by child frames and
+        excludes engine startup and other snapshots throughout serialization.
+        Hosts must also avoid concurrent direct mutations of runtime objects.
+
         A restored state with a graph-aware migration must first attach its graph
         so persisted identities can be converted safely. Refusing to serialize
         before that point prevents unconverted data from being labeled current.
@@ -274,7 +258,8 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
             The complete version 3 runtime snapshot as JSON.
 
         Raises:
-            RuntimeError: If a snapshot migration is waiting for graph attachment.
+            RuntimeError: If execution is active or a snapshot migration is
+                waiting for graph attachment.
 
         """
         if self._graph_state_migration is not None:
@@ -285,14 +270,15 @@ class RuntimeState:  # ruff:ignore[too-many-public-methods]
             raise RuntimeError(msg)
         from .v3 import dumps  # ruff:ignore[import-outside-top-level]
 
-        return dumps(self)
+        with self._graph_execution.lock_for_snapshot():
+            return dumps(self)
 
     @classmethod
     def from_snapshot(
         cls: type[RuntimeState],
         data: str,
         *,
-        ready_queue_factory: Callable[[], ReadyQueue] = _new_ready_queue,
+        ready_queue_factory: Callable[[], ReadyQueue] = InMemoryReadyQueue,
     ) -> RuntimeState:
         """Restore a snapshot with the loader named by its serialized version.
 

@@ -2,6 +2,19 @@ from graphon.nodes.base.template import Template, TextSegment, VariableSegment
 
 
 class TestTemplate:
+    def test_from_answer_template_preserves_hyphenated_selectors(self) -> None:
+        template = Template.from_answer_template(
+            "Words: {{#input-check.result.word#}} / {{#input_check.word#}}.",
+        )
+
+        assert template.segments == [
+            TextSegment("Words: "),
+            VariableSegment(["input-check", "result", "word"]),
+            TextSegment(" / "),
+            VariableSegment(["input_check", "word"]),
+            TextSegment("."),
+        ]
+
     def test_from_answer_template_simple(self) -> None:
         template_str = "Hello, {{#node1.name#}}!"
         template = Template.from_answer_template(template_str)

@@ -1,7 +1,29 @@
 import dataclasses
 
+import pytest
+
 from graphon.nodes.base import variable_template_parser
 from graphon.nodes.base.entities import VariableSelector
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    ["input-check", "550e8400-e29b-41d4-a716-446655440000", "-input-"],
+)
+def test_extracts_and_formats_hyphenated_node_references(node_id: str) -> None:
+    variable = "#" + node_id + ".result.word#"
+    template = "Word: {{" + variable + "}}"
+    expected = [
+        VariableSelector(variable=variable, value_selector=[node_id, "result", "word"]),
+    ]
+
+    parser = variable_template_parser.VariableTemplateParser(template)
+
+    assert (
+        variable_template_parser.extract_selectors_from_template(template) == expected
+    )
+    assert parser.extract_variable_selectors() == expected
+    assert parser.format({variable: "red"}) == "Word: red"
 
 
 def test_extract_selectors_from_template() -> None:

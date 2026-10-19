@@ -1,69 +1,38 @@
+<!-- knowledge
+last_checked: "2026-10-15T00:58:08Z"
+-->
 # Model Runtime
 
-This module provides the interfaces for invoking and authenticating various
-models, and offers Dify a unified information and credentials form rule for
-model providers.
+This package defines provider schemas, credential validation, capability-specific
+runtime contracts, and model wrappers. Host applications supply concrete runtime
+adapters; any provider-selection or credential UI belongs to the host.
 
-- On one hand, it decouples models from upstream and downstream processes, facilitating horizontal expansion for developers,
-- On the other hand, it allows for direct display of providers and models in the frontend interface by simply defining them in the backend, eliminating the need to modify frontend logic.
+For graph-facing nodes, use the
+[host integration guide](../../../docs/development.md#integrate-host-services).
 
-## Features
+## Choose a runtime surface
 
-- Supports capability invocation for 6 types of models
+Implement only the [capability protocols](protocols/) your adapter needs. The
+[aggregate runtime protocol](protocols/runtime.py) is for adapters that
+intentionally provide the complete surface.
 
-  - `LLM` - LLM text completion, dialogue, pre-computed tokens capability
-  - `Text Embedding Model` - Text Embedding, pre-computed tokens capability
-  - `Rerank Model` - Segment Rerank capability
-  - `Speech-to-text Model` - Speech to text capability
-  - `Text-to-speech Model` - Text to speech capability
-  - `Moderation` - Moderation capability
+Use [ModelProviderFactory](model_providers/model_provider_factory.py) for provider
+discovery and credential validation; use [capability wrappers](model_providers/)
+for invocation. [Entities](entities/) describe model parameters and credential
+forms for host UIs. The
+[model dispatch tests](../../../tests/model_runtime/test_model_dispatch.py)
+verify that provider discovery and individual capabilities remain independent.
 
-- Model provider display
+## Preserve provider message state
 
-  Displays a list of all supported providers, including provider names, icons, supported model types list, predefined model list, configuration method, and credentials form rules, etc.
+Use `opaque_body` on [assistant messages and content items](entities/message_entities.py) for provider state that must survive JSON serialization, such as signatures or encrypted reasoning.
+The field accepts `JsonValue` and defaults to `None`; the adapter owns its meaning.
+An assistant message with any non-`None` state is nonempty even without visible content or tool calls.
+See the [message entity tests](../../../tests/model_runtime/test_message_entities.py) for serialization and empty-message behavior.
 
-- Selectable model list display
+When consuming chunks, [LargeLanguageModel](model_providers/base/large_language_model.py) retains the last non-`None` assistant `opaque_body` snapshot within each invocation for both the non-stream result and the result passed to `on_after_invoke`.
+Adapters should emit complete snapshots because each replaces the previous value, including empty collections, empty strings, zero, and `False`.
+Aggregation preserves the order of mixed strings and content blocks, including each block's state; see the [model dispatch tests](../../../tests/model_runtime/test_model_dispatch.py).
 
-  After configuring provider/model credentials, the dropdown (application orchestration interface/default model) allows viewing of the available LLM list. Greyed out items represent predefined model lists from providers without configured credentials, facilitating user review of supported models.
-
-  In addition, this list also returns configurable parameter information and rules for LLM. These parameters are all defined in the backend, allowing different settings for various parameters supported by different models.
-
-- Provider/model credential authentication
-
-  The provider list returns configuration information for the credentials form, which can be authenticated through Runtime's interface.
-
-## Structure
-
-Model Runtime is divided into protocol and implementation layers:
-
-- Provider/runtime protocols
-
-  Shared provider concerns live in `protocols/provider_runtime.py`, while each
-  model capability has its own protocol module such as
-  `protocols/llm_runtime.py`, `protocols/text_embedding_runtime.py`, and
-  `protocols/tts_runtime.py`. Downstream runtimes can implement only the
-  capabilities they need instead of satisfying a single monolithic interface.
-
-- Aggregate runtime protocol
-
-  `protocols/runtime.py` composes the individual capability protocols into
-  `ModelRuntime` for adapters that intentionally implement the full surface
-  area.
-
-- Provider factory
-
-  `model_providers/model_provider_factory.py` now depends only on
-  `ModelProviderRuntime`. It handles provider discovery, provider/model schema
-  lookup, credential validation, provider icon lookup, and provider-level model
-  list projection without assuming any invocation capability.
-
-- Model wrappers
-
-  Capability wrappers such as `LargeLanguageModel`, `TextEmbeddingModel`,
-  `RerankModel`, `Speech2TextModel`, `ModerationModel`, and `TTSModel` depend
-  only on their matching capability protocol. Instantiate those wrappers
-  directly when you need invocation behavior.
-
-## Documentation
-
-For detailed documentation on how to add new providers or models, please refer to the [Dify documentation](https://docs.dify.ai/).
+[SlimLLM](../dsl/slim/llm.py) uses the same aggregation for blocking ordinary and structured output calls; see the [Slim tests](../../../tests/dsl/test_slim_llm.py).
+[Prompt filtering](../nodes/llm/llm_utils.py) preserves state on supported content blocks and keeps assistant messages with non-`None` state even when their content list is empty; see the [prompt tests](../../../tests/nodes/llm/test_llm_utils.py).

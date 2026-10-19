@@ -10,7 +10,7 @@ from graphon.variables.segment_group import SegmentGroup
 from graphon.variables.segments import Segment
 
 VARIABLE_PATTERN = re.compile(
-    r"\{\{#([a-zA-Z0-9_]{1,50}(?:\.[a-zA-Z_][a-zA-Z0-9_]{0,29}){1,10})#\}\}",
+    r"\{\{#([a-zA-Z0-9_-]{1,50}(?:\.[a-zA-Z_][a-zA-Z0-9_]{0,29}){1,10})#\}\}",
 )
 
 

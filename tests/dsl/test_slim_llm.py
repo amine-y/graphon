@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from threading import Event, Thread, current_thread
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import JsonValue
 
 import graphon.dsl.slim.llm as slim_llm_module
 from graphon.dsl.slim import SlimClientConfig, SlimClientError, SlimLLM
 from graphon.model_runtime.entities.llm_entities import LLMResult
-from graphon.model_runtime.entities.message_entities import SystemPromptMessage
+from graphon.model_runtime.entities.message_entities import (
+    AssistantPromptMessage,
+    SystemPromptMessage,
+    TextPromptMessageContent,
+)
+from graphon.model_runtime.model_providers.base.tokenizers import gpt2_tokenizer
 
 
 class _RecordingSlimClient:
@@ -205,6 +214,92 @@ def test_slim_llm_passes_merged_parameters_and_json_schema(
     assert json.loads(model_parameters["json_schema"]) == schema
 
 
+@pytest.mark.parametrize("use_structured_output", [False, True])
+@pytest.mark.parametrize("opaque_body", [{"signature": "s"}, {}, [], "", 0, False])
+def test_slim_llm_collects_mixed_content_and_latest_opaque_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    use_structured_output: bool,
+    opaque_body: JsonValue,
+) -> None:
+    client = _patch_recording_slim_client(monkeypatch)
+    block = TextPromptMessageContent(data="", opaque_body={"signature": "block"})
+    chunks: list[dict[str, Any]] = [
+        {
+            "delta": {
+                "message": {"content": content, "opaque_body": chunk_opaque_body}
+            },
+            "structured_output": {"ok": True} if index == 1 else None,
+        }
+        for index, (content, chunk_opaque_body) in enumerate([
+            ("before", {"partial": True}),
+            ([block.model_dump()], None),
+            ("after", None),
+            ("", opaque_body),
+            ("", None),
+        ])
+    ]
+    for index, arguments in enumerate(['{"city":', '"Paris"}']):
+        chunks[index]["delta"]["message"]["tool_calls"] = [
+            {
+                "id": "call-1" if index == 0 else "",
+                "type": "function",
+                "function": {
+                    "name": "weather" if index == 0 else "",
+                    "arguments": arguments,
+                },
+            },
+        ]
+    chunks[0]["system_fingerprint"] = "first"
+    chunks[-2]["system_fingerprint"] = ""
+    chunks[-1]["delta"]["usage"] = {"prompt_tokens": 3, "completion_tokens": 2}
+    monkeypatch.setattr(client, "invoke_chunks", lambda **_: iter(chunks))
+    llm = _build_llm(tmp_path)
+
+    if use_structured_output:
+        result = llm.invoke_llm_with_structured_output(
+            prompt_messages=[],
+            json_schema={"type": "object"},
+            model_parameters={},
+            stop=None,
+            stream=False,
+        )
+        assert result.structured_output == {"ok": True}
+    else:
+        result = llm.invoke_llm(
+            prompt_messages=[],
+            model_parameters={},
+            tools=None,
+            stop=None,
+            stream=False,
+        )
+
+    assert result.message == AssistantPromptMessage(
+        content=[
+            TextPromptMessageContent(data="before"),
+            block,
+            TextPromptMessageContent(data="after"),
+        ],
+        tool_calls=[
+            AssistantPromptMessage.ToolCall(
+                id="call-1",
+                type="function",
+                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                    name="weather", arguments='{"city":"Paris"}'
+                ),
+            ),
+        ],
+        opaque_body=opaque_body,
+    )
+    assert type(result.message.opaque_body) is type(opaque_body)
+    assert (
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+        result.usage.total_tokens,
+    ) == (3, 2, 5)
+    assert result.system_fingerprint == ""
+
+
 def test_slim_llm_preserves_slim_client_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -256,25 +351,156 @@ def test_slim_llm_estimates_tokens_when_timeout_is_only_in_message(
     assert token_count > 0
 
 
-def test_slim_llm_token_estimate_returns_zero_for_empty_prompt() -> None:
-    assert slim_llm_module._estimate_prompt_message_tokens([]) == 0
+@pytest.mark.parametrize("backend", ["tiktoken", "transformers"])
+def test_slim_llms_lazily_load_and_reuse_separate_tokenizers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    class Encoder:
+        def __init__(self, token_count: int) -> None:
+            self.token_count = token_count
+
+        def encode(self, text: str) -> list[int]:
+            _ = text
+            return [0] * self.token_count
+
+    encoders: list[tuple[str, Encoder]] = []
+
+    def load_encoder(encoder_backend: str) -> Encoder:
+        encoder = Encoder(len(encoders) + 1)
+        encoders.append((encoder_backend, encoder))
+        return encoder
+
+    def load_tiktoken_encoder(name: str) -> Encoder:
+        _ = name
+        if backend == "transformers":
+            msg = "tiktoken unavailable"
+            raise RuntimeError(msg)
+        return load_encoder("tiktoken")
+
+    def load_transformers_encoder(name: str) -> Encoder:
+        _ = name
+        return load_encoder("transformers")
+
+    def create_timeout_client(*, config: SlimClientConfig) -> _TimeoutSlimClient:
+        _ = config
+        return _TimeoutSlimClient()
+
+    monkeypatch.setitem(
+        sys.modules, "tiktoken", SimpleNamespace(get_encoding=load_tiktoken_encoder)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            GPT2Tokenizer=SimpleNamespace(from_pretrained=load_transformers_encoder)
+        ),
+    )
+    monkeypatch.setattr(slim_llm_module, "SlimClient", create_timeout_client)
+    first = _build_llm(tmp_path)
+    second = _build_llm(tmp_path)
+    messages = [SystemPromptMessage(content="classify this prompt")]
+
+    assert encoders == []
+    assert [
+        llm.get_llm_num_tokens(messages) for llm in (first, second, first, second)
+    ] == [1, 2, 1, 2]
+    assert [encoder_backend for encoder_backend, _ in encoders] == [backend, backend]
+
+
+def test_tokenizers_initialize_independently_and_reuse_concurrent_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_loading = Event()
+    release_first = Event()
+    repeat_started = Event()
+    completed = {name: Event() for name in ("first", "second", "repeat")}
+    loaded_by: list[str] = []
+    results: dict[str, int | Exception] = {}
+
+    class Encoder:
+        def encode(self, text: str) -> list[int]:
+            return [0] * len(text)
+
+    def load_encoder() -> Encoder:
+        name = current_thread().name
+        loaded_by.append(name)
+        if name == "first":
+            first_loading.set()
+            assert release_first.wait(timeout=5)
+        return Encoder()
+
+    def count_tokens(tokenizer: gpt2_tokenizer.GPT2Tokenizer) -> None:
+        name = current_thread().name
+        if name == "repeat":
+            repeat_started.set()
+        try:
+            results[name] = tokenizer.get_num_tokens("prompt")
+        except Exception as error:  # ruff:ignore[blind-except]
+            results[name] = error
+        finally:
+            completed[name].set()
+
+    monkeypatch.setattr(gpt2_tokenizer, "_try_load_tiktoken_encoder", load_encoder)
+    first = gpt2_tokenizer.GPT2Tokenizer()
+    second = gpt2_tokenizer.GPT2Tokenizer()
+    threads = [
+        Thread(name=name, target=count_tokens, args=(tokenizer,))
+        for name, tokenizer in (("first", first), ("second", second), ("repeat", first))
+    ]
+    threads[0].start()
+    try:
+        assert first_loading.wait(timeout=2)
+        threads[2].start()
+        threads[1].start()
+        assert repeat_started.wait(timeout=2)
+        assert completed["second"].wait(timeout=2)
+        assert not completed["repeat"].wait(timeout=0.1)
+    finally:
+        release_first.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=2)
+        assert all(not thread.is_alive() for thread in threads)
+
+    assert loaded_by == ["first", "second"]
+    assert results == {"first": 6, "second": 6, "repeat": 6}
+
+
+def test_slim_llm_token_estimate_returns_zero_for_empty_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def create_timeout_client(*, config: SlimClientConfig) -> _TimeoutSlimClient:
+        _ = config
+        return _TimeoutSlimClient()
+
+    monkeypatch.setattr(slim_llm_module, "SlimClient", create_timeout_client)
+
+    assert _build_llm(tmp_path).get_llm_num_tokens([]) == 0
 
 
 def test_slim_llm_token_estimate_uses_length_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    def fail_tokenizer(text: str) -> int:
-        _ = text
+    def create_timeout_client(*, config: SlimClientConfig) -> _TimeoutSlimClient:
+        _ = config
+        return _TimeoutSlimClient()
+
+    def fail_encoder_load() -> None:
         msg = "tokenizer unavailable"
         raise RuntimeError(msg)
 
+    monkeypatch.setattr(slim_llm_module, "SlimClient", create_timeout_client)
     monkeypatch.setattr(
-        slim_llm_module.GPT2Tokenizer,
-        "get_num_tokens",
-        fail_tokenizer,
+        gpt2_tokenizer,
+        "_try_load_tiktoken_encoder",
+        fail_encoder_load,
     )
 
-    token_count = slim_llm_module._estimate_prompt_message_tokens([
+    token_count = _build_llm(tmp_path).get_llm_num_tokens([
         SystemPromptMessage(content="x" * 20),
     ])
 

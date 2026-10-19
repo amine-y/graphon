@@ -478,6 +478,35 @@ def test_fetch_inputs_normalizes_none_to_empty_string() -> None:
     assert node._fetch_inputs(node.node_data) == {"#source.value#": ""}
 
 
+@pytest.mark.parametrize("word", ["red", "blue"])
+def test_run_sends_hyphenated_node_output_to_model(word: str) -> None:
+    model = MagicMock(
+        provider="openai",
+        model_name="gpt-4o",
+        parameters={},
+        stop=(),
+    )
+    model.get_model_schema.return_value.supports_prompt_content_type.return_value = True
+    model.invoke_llm.return_value = _stream_results(
+        _stream_chunk("ok", usage=LLMUsage.empty_usage(), finish_reason="stop"),
+    )
+    node = _build_llm_node(
+        model_instance=model,
+        prompt_text="Please process: {{#input-check.validated_input#}}",
+        variables=[(("input-check", "validated_input"), word)],
+    )
+
+    completed = next(
+        event for event in node._run() if isinstance(event, StreamCompletedEvent)
+    )
+
+    assert completed.node_run_result.status == WorkflowNodeExecutionStatus.SUCCEEDED
+    model.invoke_llm.assert_called_once()
+    messages = model.invoke_llm.call_args.kwargs["prompt_messages"]
+    assert messages[0].content == f"Please process: {word}"
+    assert completed.node_run_result.inputs["#input-check.validated_input#"] == word
+
+
 def test_run_does_not_reuse_file_outputs_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
